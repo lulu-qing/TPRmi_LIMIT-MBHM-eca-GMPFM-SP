@@ -1,0 +1,402 @@
+from models.base.fscil_trainer import FSCILTrainer as Trainer
+import os.path as osp
+import torch.nn as nn
+from copy import deepcopy
+from torch.utils.data import DataLoader
+import numpy as np
+import time
+import torch
+import torch.nn.functional as F
+
+from .helper import *
+from utils import *
+from dataloader.data_utils import *
+from dataloader.sampler import BasePreserverCategoriesSampler, NewCategoriesSampler
+from .Network import MYNET
+
+import sys
+import os
+
+# --- 新增：用于将终端输出同时保存到文件的 Logger 类 ---
+class Logger(object):
+    def __init__(self, filename="Default.log"):
+        self.terminal = sys.stdout
+        self.log = open(filename, "a", encoding="utf-8")
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush()
+
+    def flush(self):
+        self.terminal.flush()
+# ----------------------------------------------------
+
+class FSCILTrainer(Trainer):
+    def __init__(self, args):
+        super().__init__(args)
+        self.args = args
+        self.set_save_path()
+        
+        # --- 新增：接管系统输出，保存实验所有打印进度 ---
+        log_path = os.path.join(self.args.save_path, 'experiment_terminal_output.log')
+        sys.stdout = Logger(log_path)
+        print("==================================================")
+        print("实验进度与所有打印信息将同步保存在: ", log_path)
+        print("==================================================")
+        # -------------------------------------------------
+        
+        self.args = set_up_datasets(self.args)
+        self.set_up_model()
+
+        # --- 新增：初始化增量门控记忆库 (Global Gating Memory Bank) ---
+        self.global_gate_memory = {}
+
+    def set_up_model(self):
+        self.model = MYNET(self.args, mode=self.args.base_mode)
+        print(MYNET)
+        self.model = nn.DataParallel(self.model, list(range(self.args.num_gpu)))
+        self.model = self.model.cuda()
+
+        if self.args.model_dir != None:
+            print('Loading init parameters from: %s' % self.args.model_dir)
+            self.best_model_dict = torch.load(self.args.model_dir)['params']
+        else:
+            print('*********WARNING: NO INIT MODEL**********')
+            pass
+
+    def update_param(self, model, pretrained_dict):
+        model_dict = model.state_dict()
+        pretrained_dict = {k: v for k, v in pretrained_dict.items()}
+        pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
+        model_dict.update(pretrained_dict)
+        model.load_state_dict(model_dict)
+        return model
+
+    def get_dataloader(self, session):
+        if session == 0:
+            trainset, train_fsl_loader, train_gfsl_loader, testloader = self.get_base_dataloader_meta()
+            return trainset, train_fsl_loader, train_gfsl_loader, testloader
+        else:
+            trainset, trainloader, testloader, train_fsl_loader = self.get_new_dataloader(session)
+            return trainset, trainloader, testloader, train_fsl_loader
+
+    def get_base_dataloader_meta(self):
+        txt_path = "data/index_list/" + self.args.dataset + "/session_" + str(0 + 1) + '.txt'
+        if self.args.dataset == 'mbhm':
+            with open(txt_path, 'r') as f:
+                class_index = [int(line.strip()) for line in f.readlines()]
+            trainset = self.args.Dataset.MBHM(root=self.args.dataroot, train=True, index_path=txt_path)
+            testset = self.args.Dataset.MBHM(root=self.args.dataroot, train=False, index=class_index)
+        else:
+            class_index = np.arange(self.args.base_class)
+            if self.args.dataset == 'cifar100':
+                trainset = self.args.Dataset.CIFAR100(root=self.args.dataroot, train=True, download=True, index=class_index, base_sess=True, autoaug=self.args.autoaug)
+                testset = self.args.Dataset.CIFAR100(root=self.args.dataroot, train=False, download=False, index=class_index, base_sess=True, autoaug=self.args.autoaug)
+            elif self.args.dataset == 'cub200':
+                trainset = self.args.Dataset.CUB200(root=self.args.dataroot, train=True, index_path=txt_path, autoaug=self.args.autoaug)
+                testset = self.args.Dataset.CUB200(root=self.args.dataroot, train=False, index=class_index, autoaug=self.args.autoaug)
+            elif self.args.dataset == 'mini_imagenet':
+                trainset = self.args.Dataset.MiniImageNet(root=self.args.dataroot, train=True, index_path=txt_path, autoaug=self.args.autoaug)
+                testset = self.args.Dataset.MiniImageNet(root=self.args.dataroot, train=False, index=class_index, autoaug=self.args.autoaug)
+
+        train_gfsl_loader = DataLoader(dataset=trainset, batch_size=self.args.batch_size_base, shuffle=True, num_workers=8, pin_memory=True)
+        train_sampler = CategoriesSampler(trainset.targets, len(train_gfsl_loader), self.args.sample_class, self.args.sample_shot)
+        train_fsl_loader = DataLoader(dataset=trainset, batch_sampler=train_sampler, num_workers=8, pin_memory=True)
+        testloader = torch.utils.data.DataLoader(dataset=testset, batch_size=self.args.test_batch_size, shuffle=False, num_workers=8, pin_memory=True)
+        return trainset, train_fsl_loader, train_gfsl_loader, testloader
+
+    def get_new_dataloader(self, session):
+        txt_path = "data/index_list/" + self.args.dataset + "/session_" + str(session + 1) + '.txt'
+        if self.args.dataset == 'mbhm':
+            trainset = self.args.Dataset.MBHM(root=self.args.dataroot, train=True, index_path=txt_path)
+        else:
+            if self.args.dataset == 'cifar100':
+                class_index = open(txt_path).read().splitlines()
+                trainset = self.args.Dataset.CIFAR100(root=self.args.dataroot, train=True, download=False, index=class_index, base_sess=False, autoaug=self.args.autoaug)
+            elif self.args.dataset == 'cub200':
+                trainset = self.args.Dataset.CUB200(root=self.args.dataroot, train=True, index_path=txt_path, autoaug=self.args.autoaug)
+            elif self.args.dataset == 'mini_imagenet':
+                trainset = self.args.Dataset.MiniImageNet(root=self.args.dataroot, train=True, index_path=txt_path, autoaug=self.args.autoaug)
+
+        if self.args.batch_size_new == 0:
+            batch_size_new = trainset.__len__()
+            trainloader = torch.utils.data.DataLoader(dataset=trainset, batch_size=batch_size_new, shuffle=False, num_workers=8, pin_memory=True)
+        else:
+            trainloader = torch.utils.data.DataLoader(dataset=trainset, batch_size=self.args.batch_size_new, shuffle=True, num_workers=8, pin_memory=True)
+
+        test_sampler = NewCategoriesSampler(trainset.targets, 1, 5, 5)
+        train_fsl_loader = DataLoader(dataset=trainset, batch_sampler=test_sampler, num_workers=0, pin_memory=True)
+        class_new = self.get_session_classes(session)
+        
+        if self.args.dataset == 'mbhm':
+            testset = self.args.Dataset.MBHM(root=self.args.dataroot, train=False, index=class_new)
+        else:
+            if self.args.dataset == 'cifar100':
+                testset = self.args.Dataset.CIFAR100(root=self.args.dataroot, train=False, download=False, index=class_new, base_sess=False, autoaug=self.args.autoaug)
+            elif self.args.dataset == 'cub200':
+                testset = self.args.Dataset.CUB200(root=self.args.dataroot, train=False, index=class_new, autoaug=self.args.autoaug)
+            elif self.args.dataset == 'mini_imagenet':
+                testset = self.args.Dataset.MiniImageNet(root=self.args.dataroot, train=False, index=class_new, autoaug=self.args.autoaug)
+
+        testloader = torch.utils.data.DataLoader(dataset=testset, batch_size=self.args.test_batch_size, shuffle=False, num_workers=8, pin_memory=True)
+        return trainset, trainloader, testloader, train_fsl_loader
+
+    def get_session_classes(self, session):
+        if self.args.dataset == 'mbhm':
+            class_list = []
+            for i in range(session + 1):
+                txt_path = "data/index_list/" + self.args.dataset + "/session_" + str(i + 1) + ".txt"
+                with open(txt_path, 'r') as f:
+                    class_list.extend([int(line.strip()) for line in f.readlines()])
+            return np.array(class_list)
+        return np.arange(self.args.base_class + session * self.args.way)
+
+    def get_optimizer_base(self):
+        base_params = []
+        refconv_params = []
+        for name, param in self.model.module.encoder.named_parameters():
+            if 'convmap' in name or 'eca' in name:
+                refconv_params.append(param)
+            else:
+                base_params.append(param)
+        top_para = [v for k, v in self.model.named_parameters() if ('encoder' not in k and 'cls' not in k)]
+        
+        optimizer = torch.optim.SGD([
+            {'params': base_params, 'lr': 0.0},
+            {'params': top_para, 'lr': 0.0},
+            {'params': refconv_params, 'lr': self.args.lrg}
+        ], momentum=0.9, nesterov=True, weight_decay=self.args.decay)
+
+        # 【修复点】：在这里定义你的 scheduler
+        if self.args.schedule == 'Step':
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=self.args.step, gamma=self.args.gamma)
+        elif self.args.schedule == 'Milestone':
+            scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=self.args.milestones, gamma=self.args.gamma)
+        else:
+            # 如果没有匹配的调度器，定义一个默认的，防止 NoneType 错误
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=1.0)
+
+        # 【修复点】：返回 scheduler 而不是 None
+        return optimizer, scheduler
+
+    def train(self):
+        args = self.args
+        t_start_time = time.time()
+
+        print(f"开始训练，实验配置: {args.dataset}, 存储路径: {args.save_path}")
+        
+        self.result_list = [args]
+
+        for session in range(args.start_session, args.sessions):
+            if session == 0:
+                train_set, train_fsl_loader, train_gfsl_loader, testloader = self.get_dataloader(session)
+            else:
+                train_set, trainloader, testloader, train_fsl_loader = self.get_dataloader(session)
+
+            self.model = self.update_param(self.model, self.best_model_dict)
+
+            if session == 0:
+                if hasattr(train_set, 'class_indices') and train_set.class_indices is not None:
+                    print('Actual original labels for this session:\n', train_set.class_indices)
+                print('new classes for this session:\n', np.unique(train_set.targets))
+                optimizer, scheduler = self.get_optimizer_base()
+                for epoch in range(args.epochs_base):
+                    start_time = time.time()
+                    self.model.eval()
+                    tl, ta = self.base_train(self.model, train_fsl_loader, train_gfsl_loader, optimizer, scheduler, epoch, args)
+                    transform_val = getattr(testloader.dataset, 'transform', None)
+                    self.model = replace_base_fc(train_set, transform_val, self.model, args)
+                    self.model.module.mode = 'avg_cos'
+                    if args.set_no_val:
+                        save_model_dir = os.path.join(args.save_path, 'session' + str(session) + '_max_acc.pth')
+                        torch.save(dict(params=self.model.state_dict()), save_model_dir)
+                        self.best_model_dict = deepcopy(self.model.state_dict())
+                        tsl, tsa = self.test(self.model, testloader, testloader, args, session)
+                        self.trlog['test_loss'].append(tsl)
+                        self.trlog['test_acc'].append(tsa)
+                        lrc = scheduler.get_last_lr()[0]
+                        print('\n epoch:%03d,lr:%.4f,training_loss:%.5f,training_acc:%.5f,test_loss:%.5f,test_acc:%.5f' % (epoch, lrc, tl, ta, tsl, tsa))
+                        self.result_list.append('epoch:%03d,lr:%.5f,training_loss:%.5f,training_acc:%.5f,test_loss:%.5f,test_acc:%.5f' % (epoch, lrc, tl, ta, tsl, tsa))
+                    else:
+                        vl, va = self.validation()
+                        if (va * 100) >= self.trlog['max_acc'][session]:
+                            self.trlog['max_acc'][session] = float('%.3f' % (va * 100))
+                            self.trlog['max_acc_epoch'] = epoch
+                            save_model_dir = os.path.join(args.save_path, 'session' + str(session) + '_max_acc.pth')
+                            torch.save(dict(params=self.model.state_dict()), save_model_dir)
+                            self.best_model_dict = deepcopy(self.model.state_dict())
+                            print('********A better model is found!!**********')
+                        self.trlog['val_loss'].append(vl)
+                        self.trlog['val_acc'].append(va)
+                        lrc = scheduler.get_last_lr()[0]
+                        print('epoch:%03d,lr:%.4f,training_loss:%.5f,training_acc:%.5f,val_loss:%.5f,val_acc:%.5f' % (epoch, lrc, tl, ta, vl, va))
+                        self.result_list.append('epoch:%03d,lr:%.5f,training_loss:%.5f,training_acc:%.5f,val_loss:%.5f,val_acc:%.5f' % (epoch, lrc, tl, ta, vl, va))
+                    self.trlog['train_loss'].append(tl)
+                    self.trlog['train_acc'].append(ta)
+                    scheduler.step()
+                self.model.load_state_dict(self.best_model_dict)
+                best_model_dir = os.path.join(args.save_path, 'session' + str(session) + '_max_acc.pth')
+                self.best_model_dict = deepcopy(self.model.state_dict())
+                torch.save(dict(params=self.model.state_dict()), best_model_dir)
+                self.model.module.mode = 'avg_cos'
+                tsl, tsa = self.test(self.model, testloader, None, args, session)
+                self.trlog['max_acc'][session] = float('%.3f' % (tsa * 100))
+                self.result_list.append('Session {}, Test Best Epoch {},\nbest test Acc {:.4f}\n'.format(session, self.trlog['max_acc_epoch'], self.trlog['max_acc'][session]))
+            else:
+                print("training session: [%d]" % session)
+                self.model.load_state_dict(self.best_model_dict)
+                self.model.module.mode = self.args.new_mode
+                self.model.eval()
+
+                # --- 新增：提取新类别的 gating vector 并更新到 memory bank ---
+                # 在 update_fc 时，应同时计算 support set 的平均 gating vector (λ)
+                # 并将其存入 self.global_gate_memory[class_id] = mean_lambda
+                
+                self.model.module.update_fc(trainloader, np.unique(train_set.targets), session)
+
+                if hasattr(testloader.dataset, 'transform'):
+                    trainloader.dataset.transform = testloader.dataset.transform
+                    train_fsl_loader.dataset.transform = testloader.dataset.transform
+
+                    # 🚀 接收 new_lambda_dict 并更新全局记忆库
+                new_lambda_dict = self.model.module.update_fc(trainloader, np.unique(train_set.targets), session)
+                if new_lambda_dict:
+                    self.global_gate_memory.update(new_lambda_dict)
+                
+                # 🚀 将更新后的记忆库传递给模型，供 SPAMC 使用
+                self.model.module.gate_memory = self.global_gate_memory
+
+
+                self.model.module.update_fc(trainloader, np.unique(train_set.targets), session)
+                tsl, tsa = self.test(self.model, testloader, train_fsl_loader, args, session, validation=False)
+                self.trlog['max_acc'][session] = float('%.3f' % (tsa * 100))
+                save_model_dir = os.path.join(args.save_path, 'session' + str(session) + '_max_acc.pth')
+                torch.save(dict(params=self.model.state_dict()), save_model_dir)
+                self.best_model_dict = deepcopy(self.model.state_dict())
+                print('  test acc={:.3f}'.format(self.trlog['max_acc'][session]))
+                self.result_list.append('Session {}, Test Best Epoch {},\nbest test Acc {:.4f}\n'.format(session, self.trlog['max_acc_epoch'], self.trlog['max_acc'][session]))
+
+                # --- 新增：MBHM 子数据集准确率评估 ---
+                if session == args.sessions - 1:
+                    print("\n================ 计算 MBHM 各子数据集最终准确率 ================")
+                    self.model.eval()
+                    dataset_names_list = ['CWRU', 'DIRG', 'HIT', 'IMS', 'JUST', 'MFPT', 'NCEPU', 'PU', 'XJTU']
+                    group_correct = {k: 0 for k in dataset_names_list}
+                    group_total = {k: 0 for k in dataset_names_list}
+                    with torch.no_grad():
+                        sample_idx = 0 
+                        for batch in testloader:
+                            data, label = [_.cuda() for _ in batch]
+                            model = self.model.eval()
+                            model.module.mode = 'encoder'
+                            query = model(data)
+                            query = query.unsqueeze(0).unsqueeze(0)
+                            logits = model.module.forward_many(query)
+                            logits = logits[:, :args.base_class + session * args.way]
+                            preds = torch.argmax(logits, dim=1)
+                            for i in range(len(label)):
+                                current_dataset = testloader.dataset.dataset_names[sample_idx]
+                                sample_idx += 1
+                                if current_dataset in group_total:
+                                    group_total[current_dataset] += 1
+                                    if preds[i].item() == label[i].item():
+                                        group_correct[current_dataset] += 1
+                    for g in dataset_names_list:
+                        acc = (group_correct[g]/group_total[g]*100) if group_total[g]>0 else 0
+                        print(f"{g:<5} 准确率: {acc:6.2f}% ({group_correct[g]}/{group_total[g]})")
+                    print("==================================================================\n")
+
+        self.result_list.append(self.trlog['max_acc'])
+        print(self.trlog['max_acc'])
+        t_end_time = time.time()
+        total_time = (t_end_time - t_start_time) / 60
+        self.result_list.append('Best epoch:%d' % self.trlog['max_acc_epoch'])
+        save_list_to_txt(os.path.join(args.save_path, 'results.txt'), self.result_list)
+
+    def validation(self):
+        with torch.no_grad():
+            model = self.model
+            session = 1
+            trainset, trainloader, testloader, train_fsl_loader = self.get_dataloader(session)
+            if hasattr(testloader.dataset, 'transform'):
+                trainloader.dataset.transform = testloader.dataset.transform
+                train_fsl_loader.dataset.transform = testloader.dataset.transform
+            model.module.mode = 'avg_cos'
+            model.eval()
+            model.module.update_fc(trainloader, np.unique(trainset.targets), session)
+            vl, va = self.test(model, testloader, train_fsl_loader, self.args, session)
+        return vl, va
+
+    def base_train(self, model, train_fsl_loader, train_gfsl_loader, optimizer, scheduler, epoch, args):
+        tl = Averager()
+        ta = Averager()
+        for _, batch in enumerate(zip(train_fsl_loader, train_gfsl_loader)):
+            support_data, support_label = batch[0][0].cuda(), batch[0][1].cuda()
+            query_data, query_label = batch[1][0].cuda(), batch[1][1].cuda()
+            model.module.mode = 'classifier'
+            logits = model(support_data, query_data, support_label, epoch)
+            logits = logits[:, :args.base_class]
+            total_loss = F.cross_entropy(logits, query_label.view(-1, 1).repeat(1, args.num_tasks).view(-1))
+            acc = count_acc(logits, query_label.view(-1, 1).repeat(1, args.num_tasks).view(-1))
+            lrc = scheduler.get_last_lr()[0]
+            tl.add(total_loss.item())
+            ta.add(acc)
+            optimizer.zero_grad()
+            total_loss.backward()
+            optimizer.step()
+            total_loss_item = total_loss.item()
+            del logits, total_loss
+        print('Session 0, epo {}, lrc={:.4f},total loss={:.4f} query acc={:.4f}'.format(epoch, lrc, total_loss_item, acc))
+        return tl.item(), ta.item()
+
+    def test(self, model, testloader, train_fsl_loader, args, session, validation=True):
+        test_class = args.base_class + session * args.way
+        model = model.eval()
+        vl = Averager()
+        va = Averager()
+        lgt = torch.tensor([])
+        lbs = torch.tensor([])
+        with torch.no_grad():
+            for i, batch in enumerate(testloader, 1):
+                data, test_label = [_.cuda() for _ in batch]
+                model.module.mode = 'encoder'
+                query = model(data)
+                query = query.unsqueeze(0).unsqueeze(0)
+                logits = model.module.forward_many(query)
+                logits = logits[:, :test_class]
+                loss = F.cross_entropy(logits, test_label)
+                acc = count_acc(logits, test_label)
+                vl.add(loss.item())
+                va.add(acc)
+                lgt = torch.cat([lgt, logits.cpu()])
+                lbs = torch.cat([lbs, test_label.cpu()])
+            vl = vl.item()
+            va = va.item()
+            lgt = lgt.view(-1, test_class)
+            lbs = lbs.view(-1)
+            if validation is not True:
+                save_model_dir = os.path.join(args.save_path, 'session' + str(session) + 'confusion_matrix')
+                cm = confmatrix(lgt, lbs, save_model_dir)
+                perclassacc = cm.diagonal()
+                seenac = np.mean(perclassacc[:args.base_class])
+                unseenac = np.mean(perclassacc[args.base_class:])
+                print('Seen Acc:', seenac, 'Unseen ACC:', unseenac)
+                self.result_list.append('Seen Acc:%.5f, Unseen ACC:%.5f' % (seenac, unseenac))
+        return vl, va
+
+    def set_save_path(self):
+        self.args.save_path = '%s/' % self.args.dataset
+        self.args.save_path = self.args.save_path + '%s/' % self.args.project
+        self.args.save_path = self.args.save_path + '%dSC-%dEpo-%.2fT-%dSshot' % (self.args.sample_class, self.args.epochs_base, self.args.temperature, self.args.sample_shot)
+        self.args.save_path = self.args.save_path + '%.5fDec-%.2fMom-%dQ_' % (self.args.decay, self.args.momentum, self.args.batch_size_base,)
+        if self.args.schedule == 'Milestone':
+            mile_stone = str(self.args.milestones).replace(" ", "").replace(',', '_')[1:-1]
+            self.args.save_path = self.args.save_path + 'Lr1_%.6f-Lrg_%.5f-MS_%s-Gam_%.2f' % (self.args.lr_base, self.args.lrg, mile_stone, self.args.gamma,)
+        elif self.args.schedule == 'Step':
+            self.args.save_path = self.args.save_path + 'Lr1_%.6f-Lrg_%.5f-Step_%d-Gam_%.2f' % (self.args.lr_base, self.args.lrg, self.args.step, self.args.gamma,)
+        if 'ft' in self.args.new_mode:
+            self.args.save_path = self.args.save_path + '-ftLR_%.3f-ftEpoch_%d' % (self.args.lr_new, self.args.epochs_new)
+        self.args.save_path = os.path.join('checkpoint', self.args.save_path)
+        ensure_path(self.args.save_path)
+        return None
